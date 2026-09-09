@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-graphrag"
+version = "0.0.8.2"
+description = "A simple, easy-to-hack GraphRAG implementation — method-loop-separation fork with an event-hierarchy HLE orchestrator"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Jianbai Ye" },
+    { name = "chian (method-loop-separation)" },
+    { name = "architvasan (event-hierarchy fork)" },
+]
+dependencies = [
+    "future>=1.0.0",
+    "openai",
+    "tiktoken",
+    "networkx",
+    "graspologic",
+    "nano-vectordb",
+    "hnswlib",
+    "xxhash",
+    "tenacity",
+    "dspy-ai",
+    "neo4j",
+    "aioboto3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "matplotlib"]
+
+[project.urls]
+Homepage = "https://github.com/architvasan/nano-graphrag"
+Upstream = "https://github.com/gusye1234/nano-graphrag"
+
+# Console entry points. `nanograph-events` is the new event-hierarchy HLE
+# orchestrator CLI; it composes with the KG tooling (ragmosis) at runtime.
+[project.scripts]
+nanograph-events = "events.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+domain_schemas = ["*.yaml"]
+schema_profiles = ["*.yaml"]
+"*" = ["*.md", "*.yaml", "*.jsonl"]
