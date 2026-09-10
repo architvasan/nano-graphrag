@@ -19,6 +19,7 @@ from .grains import CHANNEL_SCHEMAS, QUESTION_GRAIN, grain_order
 from .kg_bridge import KGBridge
 from .sources import LLMFn, QuestionSource
 from .summary import Summary, summary_from_record
+from .merge import merge_overlay_into_parallel
 
 __all__ = ["AnswerResult", "EventOrchestrator", "build_context"]
 
@@ -46,6 +47,7 @@ class AnswerResult:
     graph_addition_proposal: list[dict] = field(default_factory=list)
     summary: Optional[Summary] = None
     confidence: float = 0.0
+    merge_report: dict = field(default_factory=dict)
 
     def as_record(self) -> dict:
         return {
@@ -57,6 +59,7 @@ class AnswerResult:
             "confidence": self.confidence,
             "subproblems": self.subproblem_summaries,
             "graph_addition_proposal": self.graph_addition_proposal,
+            "merge_report": self.merge_report,
             "summary": self.summary.as_record() if self.summary else None,
             "episode_record": self.record.as_record() if self.record else None,
         }
@@ -164,6 +167,10 @@ class EventOrchestrator:
         distill = self._distiller() if self.llm else None
         summary_tree = summary_from_record(record, question=question, distill=distill)
         answer = self._compose(question, record, summaries, summary_tree)
+        # gated merge of web-rescued edges into a parallel copy (base KG untouched)
+        parallel_ev, mreport = merge_overlay_into_parallel(self.bridge)
+        if parallel_ev is not None:
+            self.bridge.parallel_edge_ev = parallel_ev  # available for a retry pass
         return AnswerResult(
             question=question,
             answer=answer,
@@ -175,6 +182,7 @@ class EventOrchestrator:
             graph_addition_proposal=self.bridge.overlay_proposal(),
             summary=summary_tree,
             confidence=summary_tree.confidence if summary_tree else 0.0,
+            merge_report=mreport.as_record(),
         )
 
     def _distiller(self):

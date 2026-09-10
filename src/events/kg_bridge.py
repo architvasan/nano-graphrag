@@ -103,6 +103,8 @@ class KGBridge:
     #: identity -> full evidence text (graph edge sentence / web abstract). The
     #: reasoner must ground on this, not on bare node/edge identities.
     evidence: dict = field(default_factory=dict, init=False, repr=False)
+    #: parallel copy of edge_ev after a gated web-edge merge (base KG untouched).
+    parallel_edge_ev: Any = field(default=None, init=False, repr=False)
     overlay: list = field(default_factory=list, init=False, repr=False)
 
     # -- path wiring -------------------------------------------------------

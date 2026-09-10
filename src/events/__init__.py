@@ -26,6 +26,7 @@ from .sources import (
 )
 from .summary import Summary, SummaryBus, summary_from_record
 from .confidence import fact_confidence, episode_confidence, pool_confidence
+from .merge import MergeGate, MergeReport, merge_overlay_into_parallel
 
 __all__ = [
     "CHANNEL_SCHEMAS",
@@ -50,4 +51,7 @@ __all__ = [
     "fact_confidence",
     "episode_confidence",
     "pool_confidence",
+    "MergeGate",
+    "MergeReport",
+    "merge_overlay_into_parallel",
 ]
