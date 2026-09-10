@@ -142,6 +142,10 @@ class KGBridge:
     #: on-disk evidence-vector cache (content-hashed, 3072d text-embedding-3-large).
     evidence_cache_path: str = os.path.join(
         os.path.expanduser("~/.hermes/kg"), ".evidence_vectors_large.npz")
+    #: on-disk edge->ev_key join (Table A): sha1(head,rel,tail) -> md5(evidence).
+    #: Rewritten cheaply whenever the graph grows; the .npz vectors are reused.
+    edge_index_path: str = os.path.join(
+        os.path.expanduser("~/.hermes/kg"), ".edge_evidence_index.json")
 
     _embed: Any = field(default=None, init=False, repr=False)
     _retriever: Any = field(default=None, init=False, repr=False)
@@ -164,6 +168,8 @@ class KGBridge:
     _ev_vecs: dict = field(default_factory=dict, init=False, repr=False)
     _ev_cache_loaded: bool = field(default=False, init=False, repr=False)
     _ev_cache_dirty: bool = field(default=False, init=False, repr=False)
+    #: edge_key -> ev_key join (Table A), lazily loaded from edge_index_path.
+    _edge_index: Any = field(default=None, init=False, repr=False)
 
     # -- path wiring -------------------------------------------------------
     def _ensure_path(self) -> None:
@@ -206,6 +212,15 @@ class KGBridge:
         import hashlib
         return hashlib.md5((ev or "").strip().encode()).hexdigest()
 
+    @staticmethod
+    def edge_key(head: str, rel: str, tail: str) -> str:
+        """Stable id for an edge, direction-insensitive on endpoints. Used as the
+        key of the edge->ev_key join so re-typing/growing the graph only rewrites
+        this cheap map, never the embeddings."""
+        import hashlib
+        a, b = sorted((str(head), str(tail)))
+        return hashlib.sha1(f"{a}\x00{rel}\x00{b}".encode()).hexdigest()[:16]
+
     def _load_ev_cache(self) -> None:
         """Lazy-load the on-disk evidence-vector cache once. Absent file is fine
         (misses self-heal into it)."""
@@ -220,6 +235,86 @@ class KGBridge:
                 self._ev_vecs = {str(k): vecs[i] for i, k in enumerate(keys)}
         except Exception:  # noqa: BLE001  (corrupt/absent cache -> start empty)
             self._ev_vecs = {}
+
+    def update_evidence_cache(self, edges, snippet_chars: int = 300,
+                              batch: int = 256, on_progress=None) -> dict:
+        """Incrementally bring the caches up to date for ``edges`` WITHOUT
+        re-embedding anything already known. This is the join you want:
+
+          Table A  edge_index.json :  edge_key -> ev_key   (cheap, rewritten here)
+          Table B  .npz vector store: ev_key  -> vector    (embed-once, appended)
+
+        Steps: build the edge->ev_key map for the current graph, set-diff the
+        needed ev_keys against the vector store, embed ONLY the missing ones, and
+        persist both tables. Cost is O(new unique evidence), never O(all edges).
+
+        ``edges`` is an iterable of (head, rel, tail, evidence) tuples. Returns a
+        summary dict {edges, unique_ev, already, embedded, skipped_empty}."""
+        import json
+        import numpy as np
+        self._load_ev_cache()
+
+        # Table A: edge_key -> ev_key ; and the set of ev_keys we need
+        edge_index: dict[str, str] = {}
+        need: dict[str, str] = {}          # ev_key -> snippet (for embedding)
+        skipped = 0
+        for head, rel, tail, ev in edges:
+            snip = (ev or "")[:snippet_chars]
+            if not snip.strip():
+                skipped += 1
+                continue
+            ek = self._ev_key(snip)
+            edge_index[self.edge_key(head, rel, tail)] = ek
+            need.setdefault(ek, snip)
+
+        missing = [(k, s) for k, s in need.items() if k not in self._ev_vecs]
+        embedded = 0
+        for i in range(0, len(missing), batch):
+            chunk = missing[i:i + batch]
+            try:
+                vecs = self.embed_many([s for _, s in chunk])
+            except Exception:  # noqa: BLE001  (gateway stall -> resume next run)
+                self.flush_ev_cache()
+                break
+            for (k, _s), v in zip(chunk, vecs):
+                arr = np.asarray(v, dtype="float32")
+                n = float(np.linalg.norm(arr))
+                self._ev_vecs[k] = arr / n if n else arr
+            self._ev_cache_dirty = True
+            embedded += len(chunk)
+            self.flush_ev_cache()
+            if on_progress:
+                on_progress(embedded, len(missing))
+
+        # persist Table A atomically
+        os.makedirs(os.path.dirname(self.edge_index_path), exist_ok=True)
+        tmp = self.edge_index_path + f".tmp.{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump(edge_index, fh)
+        os.replace(tmp, self.edge_index_path)
+        self._edge_index = edge_index
+        return {"edges": len(edge_index), "unique_ev": len(need),
+                "already": len(need) - len(missing), "embedded": embedded,
+                "skipped_empty": skipped}
+
+    def _load_edge_index(self) -> dict:
+        """Load the edge_key -> ev_key join (Table A) if present."""
+        if self._edge_index is None:
+            import json
+            try:
+                self._edge_index = (json.load(open(self.edge_index_path))
+                                    if os.path.exists(self.edge_index_path) else {})
+            except Exception:  # noqa: BLE001
+                self._edge_index = {}
+        return self._edge_index
+
+    def vector_for_edge(self, head: str, rel: str, tail: str):
+        """Look up an edge's evidence vector via the join: edge_key -> ev_key ->
+        vector. Returns None if either table lacks it."""
+        self._load_ev_cache()
+        idx = self._load_edge_index()
+        ek = idx.get(self.edge_key(head, rel, tail))
+        return self._ev_vecs.get(ek) if ek else None
 
     def evidence_vectors(self, evs: list[str]):
         """Return unit vectors for evidence strings, aligned with ``evs``. Hits the

@@ -145,6 +145,8 @@ def _ev_bridge():
     b._ev_cache_loaded = True   # skip disk load
     b._ev_cache_dirty = False
     b.evidence_cache_path = "/tmp/hermes-test-ev-cache.npz"
+    b.edge_index_path = "/tmp/hermes-test-edge-index.json"
+    b._edge_index = None
     calls = {"n": 0, "texts": 0}
 
     def fake_embed_many(texts):
@@ -192,6 +194,45 @@ def test_evidence_cache_roundtrip_persist_and_load():
     out = b2.evidence_vectors(["measles h binds cd150"])  # pure cache hit
     assert out[0] is not None
     os.remove(b.evidence_cache_path)
+
+
+def test_edge_key_stable_and_direction_insensitive():
+    from events.kg_bridge import KGBridge
+    k1 = KGBridge.edge_key("Nipah G", "is_receptor_for", "ephrin-B2")
+    k2 = KGBridge.edge_key("ephrin-B2", "is_receptor_for", "Nipah G")  # swapped
+    k3 = KGBridge.edge_key("Nipah G", "binds", "ephrin-B2")            # diff rel
+    assert k1 == k2            # endpoint order does not matter
+    assert k1 != k3            # relation does
+    assert len(k1) == 16
+
+
+def test_update_evidence_cache_embeds_only_new():
+    import os, json
+    b, calls = _ev_bridge()
+    b._edge_index = None
+    b.edge_index_path = "/tmp/hermes-test-edge-index.json"
+    edges = [
+        ("A", "binds", "B", "alpha binds beta with high affinity per assay"),
+        ("C", "inhibits", "D", "gamma inhibits delta in the pathway strongly"),
+        ("A", "binds", "B", "alpha binds beta with high affinity per assay"),  # dup edge+ev
+    ]
+    summ = b.update_evidence_cache(edges)
+    assert summ["edges"] == 2               # dup edge collapsed
+    assert summ["unique_ev"] == 2
+    assert summ["embedded"] == 2
+    assert os.path.exists(b.edge_index_path)
+    # second call with ONE new edge -> embeds only the new evidence
+    calls["n"] = 0
+    edges2 = edges + [("E", "causes", "F", "epsilon causes phi in the model system")]
+    summ2 = b.update_evidence_cache(edges2)
+    assert summ2["embedded"] == 1           # only the new one
+    assert summ2["already"] == 2
+    # vector_for_edge resolves via the join
+    v = b.vector_for_edge("A", "binds", "B")
+    assert v is not None
+    assert b.vector_for_edge("A", "binds", "B") is b.vector_for_edge("B", "binds", "A")
+    os.remove(b.edge_index_path)
+
 
 
 
