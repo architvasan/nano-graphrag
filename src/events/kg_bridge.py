@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from .confidence import fact_confidence
 
-__all__ = ["KGBridge", "GraphFact", "OverlayEdge", "KGUnavailable"]
+__all__ = ["KGBridge", "GraphFact", "OverlayEdge", "Subgraph", "KGUnavailable"]
 
 # Default locations of the KG project; override with env vars.
 _KG_ROOT = os.environ.get(
@@ -38,6 +38,20 @@ _COARSE_POS = 3  # community-path position of the labeled top-domain communities
 
 class KGUnavailable(RuntimeError):
     """Raised when a requested KG capability's tooling/artifacts are absent."""
+
+
+def _is_stub_ev(ev: str) -> bool:
+    """Real-evidence test mirroring GraphRetriever._is_stub: empty, id-stub, or
+    too short to carry a mechanism. Used to keep subgraph facts contentful."""
+    e = (ev or "").strip()
+    return (not e) or len(e) < 25
+
+
+#: co-mention/association predicates too generic to carry a mechanism. The base
+#: retriever excludes co_occurs_with upstream; subgraph facts must drop the whole
+#: family so a query-local slice never grounds reasoning on co-mention hubs.
+_GENERIC_RELS = frozenset({"co_occurs_with", "co_occurs", "co-mention", "comention",
+                           "mentioned_with", "associated_with", "related_to"})
 
 
 @dataclass(frozen=True)
@@ -76,6 +90,37 @@ class OverlayEdge:
             "text": self.text,
             "paper_id": self.paper_id,
         }
+
+
+@dataclass
+class Subgraph:
+    """A query-local slice of the megagraph (~budget nodes), extracted once per
+    question so all downstream walks/reasoning run on a small, focused graph.
+
+    Holds the induced node set, the adjacency among them, and the evidence
+    side-table restricted to internal edges. The full megagraph is touched only
+    to build this; everything after reads from here."""
+
+    query: str
+    nodes: tuple[str, ...]                    # PPR-ranked, best first
+    adjacency: dict                           # node -> set(neighbor nodes) within the slice
+    edge_ev: dict                             # frozenset({h,t}) -> [ {rel,ev,pid} ] (subset)
+    node_rank: dict = field(default_factory=dict)  # node -> PPR rank (lower=closer)
+
+    @property
+    def n_nodes(self) -> int:
+        return len(self.nodes)
+
+    @property
+    def n_edges(self) -> int:
+        return len(self.edge_ev)
+
+    def __contains__(self, node: str) -> bool:
+        return node in self.adjacency
+
+    def as_record(self) -> dict:
+        return {"query": self.query[:80], "n_nodes": self.n_nodes,
+                "n_edges": self.n_edges, "top_nodes": list(self.nodes[:10])}
 
 
 @dataclass
@@ -188,6 +233,100 @@ class KGBridge:
                 )
             )
         return out
+
+    # -- subgraph extraction (two-stage retrieval) ------------------------
+    def extract_subgraph(self, text: str, budget: int = 500,
+                         edge_budget: Optional[int] = None,
+                         mode: str = "global") -> Optional[Subgraph]:
+        """Stage 1 of two-stage retrieval: cut a query-local ~budget-node slice
+        out of the megagraph via PPR, so every downstream walk/reason runs on the
+        small graph instead of the full 95k-edge one.
+
+        1. PPR-rank nodes for the query (reusing the retriever's gated PPR).
+        2. take top nodes until the node budget is met.
+        3. induce the subgraph: keep edges among those nodes, carrying the
+           evidence side-table subset; cap edges at ``edge_budget`` (defaults to
+           ``budget``), dropping the lowest-trust first so the most reliable edges
+           survive the cut.
+        Returns None if the retriever/graph is unavailable."""
+        edge_budget = budget if edge_budget is None else edge_budget
+        try:
+            r = self.retriever
+        except KGUnavailable:
+            return None
+        # 1-2. PPR-ranked nodes up to the budget
+        try:
+            hits = r.retrieve(text, k=budget, mode=mode)  # [(node, rank, name)]
+        except Exception as exc:  # noqa: BLE001
+            raise KGUnavailable(f"subgraph PPR failed: {exc}") from exc
+        nodes = [h[0] for h in hits][:budget]
+        node_rank = {h[0]: float(h[1]) for h in hits[:budget]}
+        nodeset = set(nodes)
+        if not nodeset:
+            return None
+        G = getattr(r, "G", None)
+        base_ev = getattr(r, "edge_ev", {}) or {}
+        edge_trust = getattr(r, "edge_trust", {}) or {}
+        # 3. induce: internal edges only, carry evidence, cap by trust
+        adjacency: dict = {n: set() for n in nodes}
+        internal: list[tuple] = []  # (key, trust)
+        for n in nodes:
+            nbrs = (G[n] if (G is not None and n in G) else [])
+            for nbr in nbrs:
+                if nbr not in nodeset or nbr == n:
+                    continue
+                adjacency[n].add(nbr)
+                key = frozenset((n, nbr))
+                if key in base_ev:
+                    tr = edge_trust.get((n, nbr), edge_trust.get((nbr, n), 0.0))
+                    internal.append((key, float(tr)))
+        # dedupe keys keeping best trust, then cap at budget (highest trust wins)
+        best: dict = {}
+        for key, tr in internal:
+            if key not in best or tr > best[key]:
+                best[key] = tr
+        kept = sorted(best.items(), key=lambda kv: kv[1], reverse=True)[:edge_budget]
+        sub_ev = {key: base_ev[key] for key, _ in kept}
+        return Subgraph(query=text, nodes=tuple(nodes), adjacency=adjacency,
+                        edge_ev=sub_ev, node_rank=node_rank)
+
+    def facts_from_subgraph(self, sub: Subgraph, text: str = "",
+                            k: int = 8, mechanism_only: bool = True) -> list[GraphFact]:
+        """GraphFacts drawn ONLY from a subgraph's edges — the small-graph analog
+        of grounded_facts. Applies the same generic/stub filter and deterministic
+        confidence, and records full evidence text. Ranks edges by the PPR rank of
+        their closest endpoint so the most query-relevant claims come first."""
+        onto = getattr(self.retriever, "ONTOLOGY_RELS", frozenset())
+        generic = onto | _GENERIC_RELS
+        try:
+            qv = self.embed(text) if text else None
+        except Exception:  # noqa: BLE001
+            qv = None
+        scored: list[tuple[float, GraphFact]] = []
+        for key, entries in sub.edge_ev.items():
+            pair = tuple(key)
+            rank = min((sub.node_rank.get(n, 1e9) for n in pair), default=1e9)
+            for e in entries or []:
+                rel = e.get("rel", "")
+                ev = e.get("ev", e.get("evidence", ""))
+                if mechanism_only and (rel in generic or _is_stub_ev(ev)):
+                    continue
+                head = " / ".join(str(n) for n in pair)
+                identity = f"{head} [{rel}]"[:120]
+                claim = f"{head}  —  {ev}"
+                pid = str(e.get("pid", "") or "")
+                rel_score = 1.0
+                if qv is not None:
+                    try:
+                        rel_score = max(0.0, self._cosine(qv, self.embed(ev[:200])))
+                    except Exception:  # noqa: BLE001
+                        rel_score = 1.0
+                conf = fact_confidence(source="graph", paper_id=pid, relevance=rel_score)
+                self.evidence[identity] = claim
+                scored.append((rank, GraphFact(identity=identity, text=claim,
+                              source="graph", paper_id=pid, confidence=conf)))
+        scored.sort(key=lambda rf: rf[0])  # lower PPR rank = closer to query
+        return [f for _, f in scored[:k]]
 
     # -- community hierarchy ----------------------------------------------
     def _load_hierarchy(self) -> None:

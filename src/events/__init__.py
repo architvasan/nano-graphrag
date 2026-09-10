@@ -16,7 +16,7 @@ from .grains import (
     SUBPROBLEM_GRAIN,
     grain_order,
 )
-from .kg_bridge import GraphFact, KGBridge, KGUnavailable, OverlayEdge
+from .kg_bridge import GraphFact, KGBridge, KGUnavailable, OverlayEdge, Subgraph
 from .orchestrator import AnswerResult, EventOrchestrator, build_context
 from .sources import (
     FrontierSource,
@@ -37,6 +37,7 @@ __all__ = [
     "grain_order",
     "GraphFact",
     "OverlayEdge",
+    "Subgraph",
     "KGBridge",
     "KGUnavailable",
     "AnswerResult",

@@ -19,11 +19,9 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-__all__ = ["MergeGate", "MergeReport", "merge_overlay_into_parallel"]
+from .kg_bridge import _GENERIC_RELS as GENERIC_RELS
 
-#: predicates that are too generic to anchor merged web knowledge.
-GENERIC_RELS = frozenset({"co_occurs_with", "co_occurs", "co-mention", "comention",
-                          "mentioned_with", "associated_with", "related_to"})
+__all__ = ["MergeGate", "MergeReport", "merge_overlay_into_parallel"]
 
 
 @dataclass
