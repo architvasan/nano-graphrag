@@ -16,9 +16,14 @@ from .grains import (
     SUBPROBLEM_GRAIN,
     grain_order,
 )
-from .kg_bridge import GraphFact, KGBridge, KGUnavailable
+from .kg_bridge import GraphFact, KGBridge, KGUnavailable, OverlayEdge
 from .orchestrator import AnswerResult, EventOrchestrator, build_context
-from .sources import FrontierSource, QuestionSource, SubproblemSource
+from .sources import (
+    FrontierSource,
+    QuestionSource,
+    SubproblemSource,
+    WebSearchSource,
+)
 
 __all__ = [
     "CHANNEL_SCHEMAS",
@@ -27,6 +32,7 @@ __all__ = [
     "SUBPROBLEM_GRAIN",
     "grain_order",
     "GraphFact",
+    "OverlayEdge",
     "KGBridge",
     "KGUnavailable",
     "AnswerResult",
@@ -35,4 +41,5 @@ __all__ = [
     "FrontierSource",
     "QuestionSource",
     "SubproblemSource",
+    "WebSearchSource",
 ]

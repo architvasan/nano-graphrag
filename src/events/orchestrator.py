@@ -42,6 +42,7 @@ class AnswerResult:
     record: Optional[EpisodeRecord] = None
     subproblem_summaries: list[dict] = field(default_factory=list)
     ended_by: str = ""
+    graph_addition_proposal: list[dict] = field(default_factory=list)
 
     def as_record(self) -> dict:
         return {
@@ -51,6 +52,7 @@ class AnswerResult:
             "n_distinct_identities": self.n_distinct_identities,
             "ended_by": self.ended_by,
             "subproblems": self.subproblem_summaries,
+            "graph_addition_proposal": self.graph_addition_proposal,
             "episode_record": self.record.as_record() if self.record else None,
         }
 
@@ -131,4 +133,5 @@ class EventOrchestrator:
             record=record,
             subproblem_summaries=summaries,
             ended_by=record.ended_by,
+            graph_addition_proposal=self.bridge.overlay_proposal(),
         )

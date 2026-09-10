@@ -60,8 +60,35 @@ def _default_llm() -> Optional[LLMFn]:
         return None
 
 
+def _default_web():
+    """Wire a standalone web backend (ragmosis OpenAlex/Semantic-Scholar rescue)
+    if reachable; else None so the bridge falls back to hermes_tools (inside the
+    Hermes runtime) or degrades gracefully. Returns query,limit -> list of
+    {"url","title","description"} hits.
+    """
+    kg_root = os.environ.get(
+        "KG_MEMORY_ROOT", os.path.expanduser("~/Desktop/Projects/kg-memory-system")
+    )
+    expt = os.path.join(kg_root, "experiments", "provenance_threshold")
+    if expt not in sys.path and os.path.isdir(expt):
+        sys.path.insert(0, expt)
+    try:
+        from graph_web_rescue import openalex_search  # type: ignore
+
+        def _web(query: str, limit: int = 4):
+            hits = openalex_search(query, k=limit) or []
+            return [
+                {"url": url, "title": title, "description": abstr}
+                for (title, abstr, _sid, url) in hits
+            ]
+
+        return _web
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _make_orchestrator(args: argparse.Namespace) -> EventOrchestrator:
-    bridge = KGBridge(gate=args.gate, pct=args.pct)
+    bridge = KGBridge(gate=args.gate, pct=args.pct, web_search_fn=_default_web())
     llm = None if args.no_llm else _default_llm()
     return EventOrchestrator(
         bridge=bridge,

@@ -18,7 +18,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-__all__ = ["KGBridge", "GraphFact", "KGUnavailable"]
+__all__ = ["KGBridge", "GraphFact", "OverlayEdge", "KGUnavailable"]
 
 # Default locations of the KG project; override with env vars.
 _KG_ROOT = os.environ.get(
@@ -47,6 +47,32 @@ class GraphFact:
     source: str            # "graph" | "web_fill"
     paper_id: str = ""
     linked_to: str = ""    # for web_fill: the subgraph node it was attached to
+    link_score: float = 0.0  # cosine of the web node to its linked subgraph node
+
+
+@dataclass
+class OverlayEdge:
+    """A run-local proposed edge: a web node attached to a base-graph node.
+
+    Overlay edges live only for this run (never written to the base KG). They
+    make web-discovered nodes traversable by later graph walks in the same
+    subproblem, and together form the reviewable graph-addition proposal a
+    completed run may emit (charter: acquisition never mutates the graph)."""
+
+    web_identity: str
+    base_node: str
+    score: float
+    text: str
+    paper_id: str = ""
+
+    def as_record(self) -> dict:
+        return {
+            "web_identity": self.web_identity,
+            "base_node": self.base_node,
+            "score": round(self.score, 4),
+            "text": self.text,
+            "paper_id": self.paper_id,
+        }
 
 
 @dataclass
@@ -58,12 +84,17 @@ class KGBridge:
     community_json: str = _COMMUNITY_JSON
     gate: str = "forman"
     pct: float = 0.3
+    #: Injectable web backend: query -> list of {"url","title","description"}.
+    #: Defaults to hermes_tools inside the Hermes runtime; inject a callable
+    #: (e.g. ragmosis OpenAlex/Semantic-Scholar rescue) to run standalone.
+    web_search_fn: Any = None
 
     _embed: Any = field(default=None, init=False, repr=False)
     _retriever: Any = field(default=None, init=False, repr=False)
     _hierarchy: Any = field(default=None, init=False, repr=False)
     _name2comm: dict = field(default_factory=dict, init=False, repr=False)
     _coarse_label: dict = field(default_factory=dict, init=False, repr=False)
+    overlay: list = field(default_factory=list, init=False, repr=False)
 
     # -- path wiring -------------------------------------------------------
     def _ensure_path(self) -> None:
@@ -206,6 +237,126 @@ class KGBridge:
             )
         except Exception:  # noqa: BLE001
             return None
+
+    def _web_hits(self, query: str, limit: int) -> list[dict]:
+        """Return web hits [{"url","title","description"}] from the injected
+        backend, or hermes_tools inside the Hermes runtime. Empty on absence —
+        the surface degrades gracefully rather than fabricating results."""
+        if self.web_search_fn is not None:
+            try:
+                hits = self.web_search_fn(query, limit) or []
+                # normalize: accept either a list of dicts or the hermes shape
+                if isinstance(hits, dict):
+                    hits = hits.get("data", {}).get("web", [])
+                return list(hits)
+            except Exception:  # noqa: BLE001
+                return []
+        try:
+            from hermes_tools import web_search  # type: ignore
+        except Exception:  # noqa: BLE001
+            return []
+        try:
+            hits = web_search(query, limit=limit)
+            return (hits or {}).get("data", {}).get("web", [])
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _web_body(self, url: str, fallback: str = "") -> str:
+        """Fetch page body via hermes_tools if available, else the fallback."""
+        if not url:
+            return fallback
+        try:
+            from hermes_tools import web_extract  # type: ignore
+        except Exception:  # noqa: BLE001
+            return fallback
+        try:
+            ex = web_extract([url], char_limit=2000)
+            res = (ex or {}).get("results", [])
+            return (res[0].get("content") or "")[:800] if res else fallback
+        except Exception:  # noqa: BLE001
+            return fallback
+
+    def _cosine(self, a, b) -> float:
+        """Cosine of two embedding vectors (both unit-norm already; dot = cosine)."""
+        try:
+            return float(sum(x * y for x, y in zip(a, b)))
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def web_facts(
+        self,
+        query: str,
+        *,
+        limit: int = 4,
+        link_nodes: Optional[list[str]] = None,
+        min_link_score: float = 0.0,
+    ) -> list[GraphFact]:
+        """Search the web and LINK each result into the graph at the same time.
+
+        For each hit: embed its text, attach it to the nearest node in
+        ``link_nodes`` (the retrieved subgraph) by cosine, record an
+        :class:`OverlayEdge` on the run-local overlay, and return it as a
+        GraphFact. The overlay makes these nodes traversable by later graph
+        walks in the same subproblem WITHOUT mutating the base KG (charter:
+        acquisition emits a reviewable proposal, never an in-run graph write).
+
+        This is a string/graph task (rule 2): it never emits a verdict.
+        """
+        results = self._web_hits(query, limit)
+        if not results:
+            return []
+        # Precompute embeddings of the subgraph anchor nodes for linking.
+        anchors: list[tuple[str, Any]] = []
+        for n in link_nodes or []:
+            try:
+                anchors.append((n, self.embed(n)))
+            except Exception:  # noqa: BLE001
+                break
+        out: list[GraphFact] = []
+        for hit in results:
+            url = hit.get("url", "")
+            title = hit.get("title", "") or query
+            desc = hit.get("description", "") or ""
+            body = self._web_body(url, fallback=desc)
+            text = f"{title}. {body or desc}".strip()
+            identity = title[:120]
+            # link into the subgraph: nearest anchor by cosine
+            best_node, best_score = "", 0.0
+            if anchors:
+                try:
+                    wv = self.embed(text[:400])
+                    for node, av in anchors:
+                        sc = self._cosine(wv, av)
+                        if sc > best_score:
+                            best_node, best_score = node, sc
+                except Exception:  # noqa: BLE001
+                    pass
+            if best_node and best_score < min_link_score:
+                continue  # too weak a link to be trustworthy graph material
+            self.overlay.append(
+                OverlayEdge(
+                    web_identity=identity,
+                    base_node=best_node,
+                    score=best_score,
+                    text=text,
+                    paper_id=url,
+                )
+            )
+            out.append(
+                GraphFact(
+                    identity=identity,
+                    text=text,
+                    source="web_fill",
+                    paper_id=url,
+                    linked_to=best_node,
+                    link_score=best_score,
+                )
+            )
+        return out
+
+    def overlay_proposal(self) -> list[dict]:
+        """The reviewable graph-addition proposal accumulated this run."""
+        return [e.as_record() for e in self.overlay]
 
     # -- diagnostics -------------------------------------------------------
     def capabilities(self) -> dict:
