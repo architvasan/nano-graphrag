@@ -24,6 +24,7 @@ from .sources import (
     SubproblemSource,
     WebSearchSource,
 )
+from .summary import Summary, SummaryBus, summary_from_record
 
 __all__ = [
     "CHANNEL_SCHEMAS",
@@ -42,4 +43,7 @@ __all__ = [
     "QuestionSource",
     "SubproblemSource",
     "WebSearchSource",
+    "Summary",
+    "SummaryBus",
+    "summary_from_record",
 ]

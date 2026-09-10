@@ -18,6 +18,7 @@ from method_loop import Context, Episode, EpisodeRecord
 from .grains import CHANNEL_SCHEMAS, QUESTION_GRAIN, grain_order
 from .kg_bridge import KGBridge
 from .sources import LLMFn, QuestionSource
+from .summary import Summary, summary_from_record
 
 __all__ = ["AnswerResult", "EventOrchestrator", "build_context"]
 
@@ -43,6 +44,7 @@ class AnswerResult:
     subproblem_summaries: list[dict] = field(default_factory=list)
     ended_by: str = ""
     graph_addition_proposal: list[dict] = field(default_factory=list)
+    summary: Optional[Summary] = None
 
     def as_record(self) -> dict:
         return {
@@ -53,6 +55,7 @@ class AnswerResult:
             "ended_by": self.ended_by,
             "subproblems": self.subproblem_summaries,
             "graph_addition_proposal": self.graph_addition_proposal,
+            "summary": self.summary.as_record() if self.summary else None,
             "episode_record": self.record.as_record() if self.record else None,
         }
 
@@ -83,27 +86,40 @@ class EventOrchestrator:
             )
         return out
 
-    def _compose(self, question: str, record: EpisodeRecord, summaries: list[dict]) -> str:
-        """Compose the final answer string from the upward-fanned identities.
+    def _compose(
+        self,
+        question: str,
+        record: EpisodeRecord,
+        summaries: list[dict],
+        summary_tree: Optional[Summary] = None,
+    ) -> str:
+        """Compose the final answer string from the distilled summary tree.
 
         This is the one model call at the root (rule 2: a string task). If no LLM
         is injected, return a deterministic evidence digest instead of fabricating
-        an answer."""
+        an answer. Prefers the distilled per-subproblem summaries over raw
+        identity strings when a summary tree is available."""
         identities = list(record.distinct_identities)
         if self.llm is None:
             top = ", ".join(identities[:12]) if identities else "(no identities reached)"
             return f"[no-LLM evidence digest] reached nodes: {top}"
+        # Prefer distilled subproblem summaries (memory) over raw identities.
         blocks = []
-        for s in summaries:
-            ids = ", ".join(s["distinct_identities"][:10]) or "(none)"
-            blocks.append(f"- {s['subproblem']} [{s['ended_by']}]: {ids}")
+        if summary_tree is not None and summary_tree.children:
+            for c in summary_tree.children:
+                digest = c.text or "; ".join(c.key_relations[:6]) or "(none)"
+                blocks.append(f"- {c.scope_key} [{c.ended_by}]: {digest}")
+        else:
+            for s in summaries:
+                ids = ", ".join(s["distinct_identities"][:10]) or "(none)"
+                blocks.append(f"- {s['subproblem']} [{s['ended_by']}]: {ids}")
         joined = "\n".join(blocks) if blocks else "(no subproblem evidence)"
         prompt = (
             f"Question:\n{question}\n\n"
-            f"Evidence reached by graph pathfinding across subproblems "
-            f"(each line is one subproblem and the distinct nodes it reached):\n"
+            f"Distilled findings across subproblems "
+            f"(each line is one subproblem and what it established):\n"
             f"{joined}\n\n"
-            f"Using only this evidence, give the best-supported concise answer. "
+            f"Using only these findings, give the best-supported concise answer. "
             f"If the evidence is insufficient, say what is missing."
         )
         try:
@@ -124,7 +140,10 @@ class EventOrchestrator:
         root = Episode(grain=QUESTION_GRAIN, key=key, source=source)
         record = root.run(ctx)  # the kernel owns the loop; verdict is numerical
         summaries = self._summaries(record)
-        answer = self._compose(question, record, summaries)
+        # distilled-memory tree (parallel to the numerical credit channel)
+        distill = self._distiller() if self.llm else None
+        summary_tree = summary_from_record(record, question=question, distill=distill)
+        answer = self._compose(question, record, summaries, summary_tree)
         return AnswerResult(
             question=question,
             answer=answer,
@@ -134,4 +153,17 @@ class EventOrchestrator:
             subproblem_summaries=summaries,
             ended_by=record.ended_by,
             graph_addition_proposal=self.bridge.overlay_proposal(),
+            summary=summary_tree,
         )
+
+    def _distiller(self):
+        """Wrap the LLM as a Summary distiller: (text, relations) -> 1-2 sentences."""
+        def _d(text: str, relations: list[str]) -> str:
+            joined = "\n".join(f"- {r}" for r in relations[:8])
+            prompt = (
+                f"Topic: {text}\n\nEvidence relations reached:\n{joined}\n\n"
+                "In 1-2 sentences, state what these relations establish about the "
+                "topic. Use only the evidence; do not add outside facts."
+            )
+            return (self.llm(prompt) or "").strip()
+        return _d
