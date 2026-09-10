@@ -150,6 +150,10 @@ class KGBridge:
     evidence: dict = field(default_factory=dict, init=False, repr=False)
     #: parallel copy of edge_ev after a gated web-edge merge (base KG untouched).
     parallel_edge_ev: Any = field(default=None, init=False, repr=False)
+    #: when set (by the orchestrator, once per question), grounded_facts reads
+    #: from this ~500-node slice instead of the full megagraph — two-stage
+    #: retrieval, so every walk runs on the small graph.
+    active_subgraph: Any = field(default=None, init=False, repr=False)
     overlay: list = field(default_factory=list, init=False, repr=False)
 
     # -- path wiring -------------------------------------------------------
@@ -191,7 +195,13 @@ class KGBridge:
 
     def grounded_facts(self, text: str, k: int = 8, mechanism_only: bool = True) -> list[GraphFact]:
         """PPR + typed-edge evidence for a query, as GraphFact claims, each with
-        a deterministic provenance-weighted confidence (relevance x prov tier)."""
+        a deterministic provenance-weighted confidence (relevance x prov tier).
+
+        Two-stage: when an active_subgraph is set (extracted once per question),
+        read from that ~500-node slice instead of re-querying the full megagraph."""
+        if self.active_subgraph is not None:
+            return self.facts_from_subgraph(self.active_subgraph, text=text, k=k,
+                                            mechanism_only=mechanism_only)
         r = self.retriever
         try:
             raw = r.retrieve_grounded(

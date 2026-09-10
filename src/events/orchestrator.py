@@ -74,11 +74,17 @@ class EventOrchestrator:
     llm: Optional[LLMFn] = None
     max_subproblems: int = 4
     max_walks: int = 2
+    #: node budget for the per-question subgraph slice; 0 disables two-stage
+    #: retrieval (walks hit the full megagraph, the pre-optimization path).
+    subgraph_budget: int = 500
     #: optional (temperature -> LLMFn) factory; when set, tournament_answer builds
     #: a diverging LLM per attempt at a rising temperature so rival hypotheses
     #: actually differ. Without it, attempts share self.llm (may collapse to one).
     llm_factory: Optional[Callable[[float], Optional[LLMFn]]] = None
     tournament_temps: tuple = (0.0, 0.5, 0.9, 1.1)
+    #: per-question subgraph cache (question -> Subgraph) so tournament attempts
+    #: on one question reuse a single extraction.
+    _subgraph_cache: dict = field(default_factory=dict, repr=False)
 
     def _summaries(self, record: EpisodeRecord) -> list[dict]:
         """Read the child (subproblem) records — memory that fanned up."""
@@ -158,16 +164,34 @@ class EventOrchestrator:
 
     def answer_question(self, question: str, key: str = "q") -> AnswerResult:
         ctx = build_context()
-        source = QuestionSource(
-            ctx,
-            self.bridge,
-            question,
-            self.llm,
-            max_subproblems=self.max_subproblems,
-            max_walks=self.max_walks,
-        )
-        root = Episode(grain=QUESTION_GRAIN, key=key, source=source)
-        record = root.run(ctx)  # the kernel owns the loop; verdict is numerical
+        # stage 1: cut a query-local subgraph once; every walk then reads the
+        # slice via bridge.grounded_facts (two-stage retrieval). Best-effort —
+        # if extraction is unavailable, walks fall back to the full graph. The
+        # slice is cached per question so the 4 tournament attempts on the same
+        # question reuse one extraction instead of re-cutting the megagraph.
+        if self.subgraph_budget:
+            try:
+                cached = self._subgraph_cache.get(question)
+                if cached is None:
+                    cached = self.bridge.extract_subgraph(
+                        question, budget=self.subgraph_budget)
+                    self._subgraph_cache[question] = cached
+                self.bridge.active_subgraph = cached
+            except Exception:  # noqa: BLE001
+                self.bridge.active_subgraph = None
+        try:
+            source = QuestionSource(
+                ctx,
+                self.bridge,
+                question,
+                self.llm,
+                max_subproblems=self.max_subproblems,
+                max_walks=self.max_walks,
+            )
+            root = Episode(grain=QUESTION_GRAIN, key=key, source=source)
+            record = root.run(ctx)  # the kernel owns the loop; verdict is numerical
+        finally:
+            self.bridge.active_subgraph = None  # slice is per-question; clear it
         summaries = self._summaries(record)
         # distilled-memory tree (parallel to the numerical credit channel)
         distill = self._distiller() if self.llm else None
