@@ -72,11 +72,14 @@ def _fact_credit(fact: GraphFact, extracted: GraphFact) -> CreditResult:
     """Deterministic projection: the node identity this hop reached. No model.
 
     A hop that reached nothing usable (empty identity) makes no crediting
-    judgement (active=False) rather than a fake zero-yield."""
+    judgement (active=False) rather than a fake zero-yield. The fact's
+    deterministic provenance confidence rides in the note as ``conf=<0-1>`` so
+    the summary layer can aggregate an episode confidence without touching the
+    frozen CreditResult schema."""
     ident = (extracted.identity or "").strip()
     if not ident:
         return CreditResult.disabled("hop reached no usable node identity")
-    return CreditResult(credits=(ident,))
+    return CreditResult(credits=(ident,), note=f"conf={extracted.confidence:.4f}")
 
 
 def _hop_leaf(fact: GraphFact, index: int) -> Leaf:

@@ -25,6 +25,7 @@ from .sources import (
     WebSearchSource,
 )
 from .summary import Summary, SummaryBus, summary_from_record
+from .confidence import fact_confidence, episode_confidence, pool_confidence
 
 __all__ = [
     "CHANNEL_SCHEMAS",
@@ -46,4 +47,7 @@ __all__ = [
     "Summary",
     "SummaryBus",
     "summary_from_record",
+    "fact_confidence",
+    "episode_confidence",
+    "pool_confidence",
 ]

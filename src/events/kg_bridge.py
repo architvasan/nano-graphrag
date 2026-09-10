@@ -18,6 +18,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .confidence import fact_confidence
+
 __all__ = ["KGBridge", "GraphFact", "OverlayEdge", "KGUnavailable"]
 
 # Default locations of the KG project; override with env vars.
@@ -48,6 +50,7 @@ class GraphFact:
     paper_id: str = ""
     linked_to: str = ""    # for web_fill: the subgraph node it was attached to
     link_score: float = 0.0  # cosine of the web node to its linked subgraph node
+    confidence: float = 0.0  # deterministic provenance-weighted 0-1 confidence
 
 
 @dataclass
@@ -134,7 +137,8 @@ class KGBridge:
         return list(r._seeds(qv, m=m)) if hasattr(r, "_seeds") else []
 
     def grounded_facts(self, text: str, k: int = 8, mechanism_only: bool = True) -> list[GraphFact]:
-        """PPR + typed-edge evidence for a query, as GraphFact claims."""
+        """PPR + typed-edge evidence for a query, as GraphFact claims, each with
+        a deterministic provenance-weighted confidence (relevance x prov tier)."""
         r = self.retriever
         try:
             raw = r.retrieve_grounded(
@@ -143,21 +147,35 @@ class KGBridge:
             )
         except Exception as exc:  # noqa: BLE001
             raise KGUnavailable(f"retrieve_grounded failed: {exc}") from exc
+        # query embedding for the relevance signal (best-effort; 1.0 if unavailable)
+        try:
+            qv = self.embed(text)
+        except Exception:  # noqa: BLE001
+            qv = None
         out: list[GraphFact] = []
         for t, s in raw:
-            text = str(t)
+            claim = str(t)
             paper_id = str(s)
             # The claim identity is the triple/head of the text (before the em-dash
             # evidence separator). retrieve_grounded returns (claim_text, paper_id).
-            identity = text.split("  —  ")[0].strip()[:120] if text else ""
+            identity = claim.split("  —  ")[0].strip()[:120] if claim else ""
             if not identity:
                 continue
+            pid = paper_id if paper_id and paper_id.lower() != "none" else ""
+            rel = 1.0
+            if qv is not None:
+                try:
+                    rel = max(0.0, self._cosine(qv, self.embed(identity)))
+                except Exception:  # noqa: BLE001
+                    rel = 1.0
+            conf = fact_confidence(source="graph", paper_id=pid, relevance=rel)
             out.append(
                 GraphFact(
                     identity=identity,
-                    text=text,
+                    text=claim,
                     source="graph",
-                    paper_id=paper_id if paper_id and paper_id.lower() != "none" else "",
+                    paper_id=pid,
+                    confidence=conf,
                 )
             )
         return out
@@ -350,6 +368,12 @@ class KGBridge:
                     paper_id=url,
                     linked_to=best_node,
                     link_score=best_score,
+                    confidence=fact_confidence(
+                        source="web_fill",
+                        paper_id=url,
+                        relevance=max(0.0, best_score) if best_node else 1.0,
+                        link_score=best_score,
+                    ),
                 )
             )
         return out

@@ -45,6 +45,7 @@ class AnswerResult:
     ended_by: str = ""
     graph_addition_proposal: list[dict] = field(default_factory=list)
     summary: Optional[Summary] = None
+    confidence: float = 0.0
 
     def as_record(self) -> dict:
         return {
@@ -53,6 +54,7 @@ class AnswerResult:
             "n_subproblems": self.n_subproblems,
             "n_distinct_identities": self.n_distinct_identities,
             "ended_by": self.ended_by,
+            "confidence": self.confidence,
             "subproblems": self.subproblem_summaries,
             "graph_addition_proposal": self.graph_addition_proposal,
             "summary": self.summary.as_record() if self.summary else None,
@@ -154,6 +156,7 @@ class EventOrchestrator:
             ended_by=record.ended_by,
             graph_addition_proposal=self.bridge.overlay_proposal(),
             summary=summary_tree,
+            confidence=summary_tree.confidence if summary_tree else 0.0,
         )
 
     def _distiller(self):

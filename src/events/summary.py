@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from .confidence import episode_confidence, pool_confidence
+
 __all__ = ["Summary", "SummaryBus", "distill_summary", "summary_from_record"]
 
 # Optional distiller: (question/subproblem text, evidence lines) -> summary text.
@@ -29,8 +31,9 @@ class Summary:
 
     ``text`` is the human-readable distillation; ``key_relations`` are the most
     salient edges/claims (verbatim, never invented); ``n_identities`` is the
-    credit count carried alongside (diagnostic, not the verdict); ``children``
-    are the nested summaries fanned up from this episode's child units.
+    credit count carried alongside (diagnostic, not the verdict); ``confidence``
+    is the deterministic provenance-weighted 0-1 score for this episode;
+    ``children`` are the nested summaries fanned up from this episode's units.
     """
 
     scope_key: str
@@ -38,6 +41,7 @@ class Summary:
     text: str = ""
     key_relations: list[str] = field(default_factory=list)
     n_identities: int = 0
+    confidence: float = 0.0
     ended_by: str = ""
     children: list["Summary"] = field(default_factory=list)
 
@@ -48,6 +52,7 @@ class Summary:
             "text": self.text,
             "key_relations": self.key_relations,
             "n_identities": self.n_identities,
+            "confidence": self.confidence,
             "ended_by": self.ended_by,
             "children": [c.as_record() for c in self.children],
         }
@@ -164,22 +169,35 @@ def summary_from_record(
     _depth: int = 0,
 ) -> Summary:
     """Post-run reduction: build the full nested Summary tree from an
-    EpisodeRecord. Complements the incremental on_unit capture — the record
-    already holds the whole tree, so this reconstructs summaries at every scope
-    with optional LLM distillation at the reasoning levels (question/subproblem).
+    EpisodeRecord, computing a deterministic 0-1 confidence at every scope.
 
-    Distillation is applied only where it adds value (episodes with children);
-    leaf-heavy walk levels keep their verbatim relations to avoid paraphrase
-    drift on the actual evidence."""
+    Confidence origin: each leaf hop's credit_note carries ``conf=<0-1>`` (the
+    fact's provenance-weighted score). A walk's confidence is the identity-
+    weighted aggregate of its hop confidences; a subproblem/question aggregates
+    its children's confidences. Distillation (text) is applied ONLY at reasoning
+    levels; walk levels keep verbatim relations to avoid paraphrase drift."""
     scope_key = getattr(record, "scope_key", "?")
     kind = _infer_kind(scope_key) if _depth else "question"
     children: list[Summary] = []
+    hop_confs: list[float] = []
     for unit in getattr(record, "unit_records", []):
         child_rec = getattr(unit, "child", None)
         if child_rec is not None:
             children.append(summary_from_record(child_rec, question, distill, _depth + 1))
+        else:
+            # leaf hop: pull the deterministic conf tag from the credit note
+            hop_confs.append(_parse_conf(getattr(unit, "credit_note", "")))
     relations = list(getattr(record, "distinct_identities", []))
-    # distill only at reasoning levels that have children; keep walk relations raw
+    ended_by = getattr(record, "ended_by", "")
+    counted = ended_by in ("yield_stop", "exhausted")
+    if children:
+        # pool child episode confidences (independent branches corroborate;
+        # parent is never less confident than its best-supported child)
+        conf = pool_confidence(
+            [c.confidence for c in children], counted=counted
+        )
+    else:
+        conf = episode_confidence(hop_confs, ended_by=ended_by, counted=counted)
     text = ""
     if children and kind in ("question", "subproblem"):
         text = distill_summary(question or scope_key, relations[:12], distill)
@@ -189,6 +207,17 @@ def summary_from_record(
         text=text,
         key_relations=relations[:12],
         n_identities=len(relations),
-        ended_by=getattr(record, "ended_by", ""),
+        confidence=conf,
+        ended_by=ended_by,
         children=children,
     )
+
+
+def _parse_conf(note: str) -> float:
+    """Extract the ``conf=<float>`` tag a leaf credit note carries; 0.0 if absent."""
+    if not note or "conf=" not in note:
+        return 0.0
+    try:
+        return float(note.split("conf=", 1)[1].split()[0])
+    except (ValueError, IndexError):
+        return 0.0
