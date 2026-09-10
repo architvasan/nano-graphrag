@@ -141,6 +141,7 @@ class FrontierSource:
         seen = {f.identity for f in self._frontier}
         for e in getattr(self._bridge, "overlay", []):
             if e.web_identity not in seen:
+                self._bridge.evidence.setdefault(e.web_identity, e.text)
                 self._frontier.append(
                     GraphFact(
                         identity=e.web_identity,

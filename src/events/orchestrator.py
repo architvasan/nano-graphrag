@@ -88,6 +88,18 @@ class EventOrchestrator:
             )
         return out
 
+    def _evidence_for(self, identities: list[str], limit: int = 6) -> str:
+        """Expand identities into their FULL evidence text (edge sentence / web
+        abstract) from the bridge registry — the reasoner grounds on documents,
+        not bare node/edge names. Falls back to the identity when no evidence was
+        recorded (never drops the relation silently)."""
+        ev = getattr(self.bridge, "evidence", {})
+        lines = []
+        for ident in identities[:limit]:
+            full = ev.get(ident, "")
+            lines.append(f"  • {full}" if full else f"  • {ident}")
+        return "\n".join(lines)
+
     def _compose(
         self,
         question: str,
@@ -95,34 +107,40 @@ class EventOrchestrator:
         summaries: list[dict],
         summary_tree: Optional[Summary] = None,
     ) -> str:
-        """Compose the final answer string from the distilled summary tree.
+        """Compose the final answer from full grounded evidence text.
 
-        This is the one model call at the root (rule 2: a string task). If no LLM
-        is injected, return a deterministic evidence digest instead of fabricating
-        an answer. Prefers the distilled per-subproblem summaries over raw
-        identity strings when a summary tree is available."""
+        This is the one model call at the root (rule 2: a string task). The
+        reasoner is given each subproblem's FULL evidence documents (edge
+        sentences and web abstracts), not bare identities, plus its distilled
+        summary and confidence. No LLM -> deterministic evidence digest."""
         identities = list(record.distinct_identities)
         if self.llm is None:
-            top = ", ".join(identities[:12]) if identities else "(no identities reached)"
-            return f"[no-LLM evidence digest] reached nodes: {top}"
-        # Prefer distilled subproblem summaries (memory) over raw identities.
+            top = self._evidence_for(identities, limit=8) or "(no evidence reached)"
+            return f"[no-LLM evidence digest]\n{top}"
         blocks = []
         if summary_tree is not None and summary_tree.children:
             for c in summary_tree.children:
-                digest = c.text or "; ".join(c.key_relations[:6]) or "(none)"
-                blocks.append(f"- {c.scope_key} [{c.ended_by}]: {digest}")
+                evidence = self._evidence_for(c.key_relations, limit=6)
+                digest = c.text or "(no distilled summary)"
+                blocks.append(
+                    f"- {c.scope_key} [{c.ended_by}, confidence={c.confidence:.2f}]:\n"
+                    f"  summary: {digest}\n  evidence:\n{evidence}"
+                )
         else:
             for s in summaries:
-                ids = ", ".join(s["distinct_identities"][:10]) or "(none)"
-                blocks.append(f"- {s['subproblem']} [{s['ended_by']}]: {ids}")
+                blocks.append(
+                    f"- {s['subproblem']} [{s['ended_by']}]:\n"
+                    f"{self._evidence_for(s['distinct_identities'], limit=6)}"
+                )
         joined = "\n".join(blocks) if blocks else "(no subproblem evidence)"
         prompt = (
             f"Question:\n{question}\n\n"
-            f"Distilled findings across subproblems "
-            f"(each line is one subproblem and what it established):\n"
+            f"Evidence gathered across subproblems (each bullet is the full "
+            f"supporting text of one graph edge or web source):\n"
             f"{joined}\n\n"
-            f"Using only these findings, give the best-supported concise answer. "
-            f"If the evidence is insufficient, say what is missing."
+            f"Reason step by step over the EVIDENCE TEXT above (not just the "
+            f"entity names) to give the best-supported concise answer. If the "
+            f"evidence is insufficient, say what is missing."
         )
         try:
             return (self.llm(prompt) or "").strip()
@@ -160,9 +178,14 @@ class EventOrchestrator:
         )
 
     def _distiller(self):
-        """Wrap the LLM as a Summary distiller: (text, relations) -> 1-2 sentences."""
+        """Wrap the LLM as a Summary distiller over FULL evidence text.
+
+        Relations arrive as identities; expand each to its recorded evidence
+        (edge sentence / web abstract) so the distillation grounds on documents,
+        not entity names — the reasoner must see the actual text."""
         def _d(text: str, relations: list[str]) -> str:
-            joined = "\n".join(f"- {r}" for r in relations[:8])
+            ev = getattr(self.bridge, "evidence", {})
+            joined = "\n".join(f"- {ev.get(r, r)}" for r in relations[:8])
             prompt = (
                 f"Topic: {text}\n\nEvidence relations reached:\n{joined}\n\n"
                 "In 1-2 sentences, state what these relations establish about the "

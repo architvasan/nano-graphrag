@@ -91,12 +91,18 @@ class KGBridge:
     #: Defaults to hermes_tools inside the Hermes runtime; inject a callable
     #: (e.g. ragmosis OpenAlex/Semantic-Scholar rescue) to run standalone.
     web_search_fn: Any = None
+    #: chars of page body pulled per web source. Abstracts alone (~200 chars)
+    #: lack quantitative rules; deeper text lets the reasoner ground on results.
+    web_body_chars: int = 2500
 
     _embed: Any = field(default=None, init=False, repr=False)
     _retriever: Any = field(default=None, init=False, repr=False)
     _hierarchy: Any = field(default=None, init=False, repr=False)
     _name2comm: dict = field(default_factory=dict, init=False, repr=False)
     _coarse_label: dict = field(default_factory=dict, init=False, repr=False)
+    #: identity -> full evidence text (graph edge sentence / web abstract). The
+    #: reasoner must ground on this, not on bare node/edge identities.
+    evidence: dict = field(default_factory=dict, init=False, repr=False)
     overlay: list = field(default_factory=list, init=False, repr=False)
 
     # -- path wiring -------------------------------------------------------
@@ -169,6 +175,7 @@ class KGBridge:
                 except Exception:  # noqa: BLE001
                     rel = 1.0
             conf = fact_confidence(source="graph", paper_id=pid, relevance=rel)
+            self.evidence[identity] = claim  # full edge sentence, not just the head
             out.append(
                 GraphFact(
                     identity=identity,
@@ -288,9 +295,9 @@ class KGBridge:
         except Exception:  # noqa: BLE001
             return fallback
         try:
-            ex = web_extract([url], char_limit=2000)
+            ex = web_extract([url], char_limit=max(2000, self.web_body_chars))
             res = (ex or {}).get("results", [])
-            return (res[0].get("content") or "")[:800] if res else fallback
+            return (res[0].get("content") or "")[: self.web_body_chars] if res else fallback
         except Exception:  # noqa: BLE001
             return fallback
 
@@ -338,6 +345,7 @@ class KGBridge:
             body = self._web_body(url, fallback=desc)
             text = f"{title}. {body or desc}".strip()
             identity = title[:120]
+            self.evidence[identity] = text  # full web abstract/body, not just title
             # link into the subgraph: nearest anchor by cosine
             best_node, best_score = "", 0.0
             if anchors:

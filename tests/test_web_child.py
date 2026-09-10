@@ -21,6 +21,7 @@ class _StubBridge:
         self._qvec = list(qvec)
         self._fvec = list(fvec)
         self.overlay = overlay or []
+        self.evidence = {}
 
     def grounded_facts(self, text, k=8, mechanism_only=True):
         return list(self._frontier)
