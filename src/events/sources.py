@@ -29,6 +29,8 @@ from method_loop import (
 
 from .grains import PATHFIND_GRAIN, SUBPROBLEM_GRAIN
 from .kg_bridge import GraphFact, KGBridge
+from .confidence import episode_confidence, pool_confidence
+from .summary import _parse_conf as _parse_conf_note
 
 __all__ = [
     "QuestionSource",
@@ -267,14 +269,21 @@ def make_websearch_episode(
 # SubproblemSource — yields PATHFIND episodes for one domain thread
 # --------------------------------------------------------------------------
 class SubproblemSource:
-    """Yields PATHFIND episodes for one subproblem.
+    """Yields PATHFIND episodes for one subproblem, escalating grounding until a
+    deterministic confidence target is met.
 
-    Locates the subproblem's community, then dispatches walks of two kinds at
-    the same grain: a graph walk, and (optionally) a spawnable web-search walk.
-    The web walk runs first when the graph frontier looks off-target so its
-    results are linked into the overlay before the graph walk traverses it.
-    Communication is UP only: each pathfind's reached identities fan up to this
-    subproblem's credits.
+    Locates the subproblem's community, then dispatches walks of two kinds at the
+    same grain — a graph walk and a spawnable web-search walk — and KEEPS issuing
+    walks until the running confidence (read from completed units' conf notes)
+    crosses ``conf_target``. Each walk escalates: web fetches fresh evidence,
+    graph traverses the overlay it seeded, alternating so confidence can only
+    rise by gathering better-grounded evidence.
+
+    Anti-gaming (see the no-abstain pathology): the stop gate is the DETERMINISTIC
+    provenance confidence, never an LLM self-report — the model cannot claim it is
+    confident to exit early. A patience bailout terminates honestly (exhausted)
+    when successive walks stop improving confidence, and ``max_walks`` is a hard
+    ceiling so the loop can never spin forever. Communication is UP only.
     """
 
     def __init__(
@@ -283,9 +292,11 @@ class SubproblemSource:
         bridge: KGBridge,
         subproblem_text: str,
         *,
-        max_walks: int = 2,
+        max_walks: int = 4,
         spawn_web: bool = True,
         web_relevance_gate: float = 0.30,
+        conf_target: float = 0.60,
+        patience: int = 2,
     ) -> None:
         self._ctx = ctx
         self._bridge = bridge
@@ -293,10 +304,13 @@ class SubproblemSource:
         self._max_walks = max_walks
         self._spawn_web = spawn_web
         self._web_gate = web_relevance_gate
+        self._conf_target = conf_target
+        self._patience = patience
         self._issued = 0
         self._coarse: Optional[int] = None
         self._located = False
-        self._plan: list[str] = []  # ordered walk kinds: "web" | "graph"
+        self._best_conf = 0.0
+        self._dry_streak = 0  # consecutive walks that didn't improve confidence
 
     def _locate(self) -> None:
         if self._located:
@@ -306,18 +320,33 @@ class SubproblemSource:
             self._coarse, _seeds = self._bridge.locate(self._text)
         except Exception:  # noqa: BLE001
             self._coarse = None
-        self._plan = self._make_plan()
 
-    def _make_plan(self) -> list[str]:
-        """Decide walk order. Web search is spawned as a child when the graph
-        frontier is thin OR off-target (low top-fact relevance to the
-        subproblem) — the relevance-gated trigger. Otherwise graph only."""
-        kinds: list[str] = []
-        if self._spawn_web and self._should_spawn_web():
-            kinds.append("web")   # web first: seeds the overlay for the graph walk
-        while len(kinds) < self._max_walks:
-            kinds.append("graph")
-        return kinds[: self._max_walks]
+    def _running_confidence(self, view: EpisodeView) -> float:
+        """Confidence so far = noisy-OR pool of completed walks' confidences,
+        each read from that walk's aggregated conf note (deterministic)."""
+        walk_confs: list[float] = []
+        for u in view.units:
+            child = getattr(u, "child", None)
+            if child is None:
+                continue
+            confs = [_parse_conf_note(getattr(cu, "credit_note", ""))
+                     for cu in getattr(child, "unit_records", [])
+                     if getattr(cu, "child", None) is None]
+            walk_confs.append(episode_confidence(
+                confs, counted=getattr(child, "ended_by", "") in ("yield_stop", "exhausted")
+            ))
+        return pool_confidence(walk_confs) if walk_confs else 0.0
+
+    def _next_kind(self) -> str:
+        """Escalation ladder: lead with web when the graph looks off-target,
+        then alternate web/graph so each walk adds a different grounding source."""
+        if self._issued == 0:
+            return "web" if (self._spawn_web and self._should_spawn_web()) else "graph"
+        # alternate afterwards; web only if enabled
+        prev_web = (self._issued % 2 == 1)
+        if self._spawn_web and not prev_web:
+            return "web"
+        return "graph"
 
     def _should_spawn_web(self) -> bool:
         """Relevance gate: spawn web search if the graph frontier is empty or
@@ -338,9 +367,21 @@ class SubproblemSource:
 
     def next(self, view: EpisodeView) -> Any:
         self._locate()
-        if self._issued >= len(self._plan):
-            return None  # exhausted: no more walks planned for this subproblem
-        kind = self._plan[self._issued]
+        # evaluate grounding so far against the deterministic confidence target
+        if self._issued > 0:
+            conf = self._running_confidence(view)
+            if conf >= self._conf_target:
+                return None  # target met: stop escalating (honest success)
+            if conf <= self._best_conf + 1e-6:
+                self._dry_streak += 1
+            else:
+                self._dry_streak = 0
+                self._best_conf = conf
+            if self._dry_streak >= self._patience:
+                return None  # patience bailout: escalation stopped helping (honest)
+        if self._issued >= self._max_walks:
+            return None  # hard ceiling: never spin forever
+        kind = self._next_kind()
         self._issued += 1
         key = f"{kind}{self._issued}"
         if kind == "web":
@@ -354,15 +395,18 @@ def make_subproblem_episode(
     subproblem_text: str,
     key: str,
     *,
-    max_walks: int = 2,
+    max_walks: int = 4,
     spawn_web: bool = True,
+    conf_target: float = 0.60,
+    patience: int = 2,
 ) -> Episode:
     """Build one SUBPROBLEM child Episode (one domain thread)."""
     return Episode(
         grain=SUBPROBLEM_GRAIN,
         key=key,
         source=SubproblemSource(
-            ctx, bridge, subproblem_text, max_walks=max_walks, spawn_web=spawn_web
+            ctx, bridge, subproblem_text, max_walks=max_walks, spawn_web=spawn_web,
+            conf_target=conf_target, patience=patience,
         ),
     )
 

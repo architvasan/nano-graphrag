@@ -44,7 +44,7 @@ def test_web_spawns_when_frontier_empty():
     ss = SubproblemSource(ctx=None, bridge=_StubBridge(frontier=[]),
                           subproblem_text="q", max_walks=2, spawn_web=True)
     ss._locate()
-    assert ss._plan[0] == "web"
+    assert ss._next_kind() == "web"  # first walk leads with web on empty graph
 
 
 def test_web_spawns_when_offtarget():
@@ -53,23 +53,23 @@ def test_web_spawns_when_offtarget():
     ss = SubproblemSource(ctx=None, bridge=b, subproblem_text="q",
                           max_walks=2, spawn_web=True, web_relevance_gate=0.30)
     ss._locate()
-    assert ss._plan[0] == "web"
+    assert ss._next_kind() == "web"
 
 
 def test_no_web_when_ontarget():
-    # top fact embeds parallel to the query -> cosine 1.0 > gate -> graph only.
+    # top fact embeds parallel to the query -> cosine 1.0 > gate -> graph first.
     b = _StubBridge(frontier=[_gf("x")], qvec=(1.0, 0.0), fvec=(1.0, 0.0))
     ss = SubproblemSource(ctx=None, bridge=b, subproblem_text="q",
                           max_walks=2, spawn_web=True, web_relevance_gate=0.30)
     ss._locate()
-    assert "web" not in ss._plan
+    assert ss._next_kind() == "graph"
 
 
 def test_spawn_web_false_never_spawns():
     ss = SubproblemSource(ctx=None, bridge=_StubBridge(frontier=[]),
                           subproblem_text="q", max_walks=2, spawn_web=False)
     ss._locate()
-    assert "web" not in ss._plan
+    assert ss._next_kind() == "graph"
 
 
 def test_graph_walk_traverses_overlay_nodes():
