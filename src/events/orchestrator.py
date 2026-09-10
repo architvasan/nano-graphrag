@@ -155,7 +155,10 @@ class EventOrchestrator:
             f"{joined}\n\n"
             f"Reason step by step over the EVIDENCE TEXT above (not just the "
             f"entity names) to give the best-supported concise answer. If the "
-            f"evidence is insufficient, say what is missing."
+            f"evidence is insufficient, say what is missing.\n"
+            f"On the FINAL line, write exactly: 'Answer: <your final answer>' "
+            f"(the answer alone — a letter for multiple-choice, else the terse "
+            f"value/phrase), so it can be graded unambiguously."
         )
         try:
             return (self.llm(prompt) or "").strip()
