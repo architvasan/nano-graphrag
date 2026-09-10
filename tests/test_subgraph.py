@@ -135,3 +135,63 @@ def test_orchestrator_extracts_once_and_clears(monkeypatch=None):
     assert calls["n"] == 1  # cached: only one real extraction
 
 
+def _ev_bridge():
+    """A bridge with a stub embedder that counts calls, for evidence-cache tests."""
+    from events.kg_bridge import KGBridge
+    import numpy as np
+    b = KGBridge.__new__(KGBridge)
+    b._embed = None
+    b._ev_vecs = {}
+    b._ev_cache_loaded = True   # skip disk load
+    b._ev_cache_dirty = False
+    b.evidence_cache_path = "/tmp/hermes-test-ev-cache.npz"
+    calls = {"n": 0, "texts": 0}
+
+    def fake_embed_many(texts):
+        calls["n"] += 1
+        calls["texts"] += len(texts)
+        return [np.ones(8, dtype="float32") * (len(t) + 1) for t in texts]
+
+    b.embed_many = fake_embed_many
+    return b, calls
+
+
+def test_evidence_vectors_cache_hit_and_dedupe():
+    b, calls = _ev_bridge()
+    # first lookup with duplicates: 3 distinct strings -> 1 embed call, 3 texts
+    out = b.evidence_vectors(["aaa", "bbb", "aaa", "ccc", "bbb"])
+    assert len(out) == 5
+    assert calls["n"] == 1
+    assert calls["texts"] == 3          # deduped: only 3 unique embedded
+    assert b._ev_cache_dirty is True
+    # duplicates share one vector
+    assert (out[0] == out[2]).all()     # both "aaa"
+    # second lookup of same strings -> ZERO new embeds (all cache hits)
+    calls["n"] = 0
+    out2 = b.evidence_vectors(["aaa", "ccc"])
+    assert calls["n"] == 0
+
+
+def test_evidence_cache_roundtrip_persist_and_load():
+    import os
+    from events.kg_bridge import KGBridge
+    b, _ = _ev_bridge()
+    b.evidence_vectors(["nipah g attaches ephrinb2", "measles h binds cd150"])
+    assert b.flush_ev_cache() is True
+    assert os.path.exists(b.evidence_cache_path)
+    # a fresh bridge loads the persisted cache -> no embed needed
+    import numpy as np
+    b2 = KGBridge.__new__(KGBridge)
+    b2._embed = None
+    b2._ev_vecs = {}
+    b2._ev_cache_loaded = False
+    b2._ev_cache_dirty = False
+    b2.evidence_cache_path = b.evidence_cache_path
+    called = {"n": 0}
+    b2.embed_many = lambda ts: (_ for _ in ()).throw(AssertionError("should not embed"))
+    out = b2.evidence_vectors(["measles h binds cd150"])  # pure cache hit
+    assert out[0] is not None
+    os.remove(b.evidence_cache_path)
+
+
+

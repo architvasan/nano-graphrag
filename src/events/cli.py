@@ -54,6 +54,7 @@ def _default_llm(temperature: float = 0.0) -> Optional[LLMFn]:
                 cluster=cluster,
                 temperature=temperature,
                 max_tokens=500,
+                timeout=float(os.environ.get("NANOGRAPH_LLM_TIMEOUT", "60")),
             )
 
         return _call

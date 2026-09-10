@@ -139,6 +139,9 @@ class KGBridge:
     #: chars of page body pulled per web source. Abstracts alone (~200 chars)
     #: lack quantitative rules; deeper text lets the reasoner ground on results.
     web_body_chars: int = 2500
+    #: on-disk evidence-vector cache (content-hashed, 3072d text-embedding-3-large).
+    evidence_cache_path: str = os.path.join(
+        os.path.expanduser("~/.hermes/kg"), ".evidence_vectors_large.npz")
 
     _embed: Any = field(default=None, init=False, repr=False)
     _retriever: Any = field(default=None, init=False, repr=False)
@@ -155,6 +158,12 @@ class KGBridge:
     #: retrieval, so every walk runs on the small graph.
     active_subgraph: Any = field(default=None, init=False, repr=False)
     overlay: list = field(default_factory=list, init=False, repr=False)
+    #: content-hashed evidence-vector cache: md5(ev_text) -> unit vec (3072d,
+    #: text-embedding-3-large, matching the query space). Loaded lazily from
+    #: evidence_cache_path; misses embed live and write back (self-healing).
+    _ev_vecs: dict = field(default_factory=dict, init=False, repr=False)
+    _ev_cache_loaded: bool = field(default=False, init=False, repr=False)
+    _ev_cache_dirty: bool = field(default=False, init=False, repr=False)
 
     # -- path wiring -------------------------------------------------------
     def _ensure_path(self) -> None:
@@ -174,6 +183,75 @@ class KGBridge:
             self._embed = _e
         vecs = self._embed([text])
         return vecs[0] if hasattr(vecs, "__getitem__") else vecs
+
+    def embed_many(self, texts: list[str]):
+        """Batched embeddings — ONE argo call for a list, instead of N calls.
+        Critical for subgraph facts: scoring ~500 edges one-embed-at-a-time was
+        247 round-trips (~147s); batched it is a single call (~2s). Returns a
+        list of vectors aligned with ``texts`` (empty input -> empty list)."""
+        if not texts:
+            return []
+        if self._embed is None:
+            self._ensure_path()
+            try:
+                from ragmosis.inference.argo_embed import embed as _e
+            except Exception as exc:  # noqa: BLE001
+                raise KGUnavailable(f"argo_embed not importable: {exc}") from exc
+            self._embed = _e
+        return self._embed(texts)
+
+    # -- evidence-vector cache (content-hashed, build once, look up forever) ---
+    @staticmethod
+    def _ev_key(ev: str) -> str:
+        import hashlib
+        return hashlib.md5((ev or "").strip().encode()).hexdigest()
+
+    def _load_ev_cache(self) -> None:
+        """Lazy-load the on-disk evidence-vector cache once. Absent file is fine
+        (misses self-heal into it)."""
+        if self._ev_cache_loaded:
+            return
+        self._ev_cache_loaded = True
+        try:
+            import numpy as np
+            if os.path.exists(self.evidence_cache_path):
+                d = np.load(self.evidence_cache_path, allow_pickle=True)
+                keys, vecs = d["keys"], d["vecs"]
+                self._ev_vecs = {str(k): vecs[i] for i, k in enumerate(keys)}
+        except Exception:  # noqa: BLE001  (corrupt/absent cache -> start empty)
+            self._ev_vecs = {}
+
+    def evidence_vectors(self, evs: list[str]):
+        """Return unit vectors for evidence strings, aligned with ``evs``. Hits the
+        content-hashed cache; MISSES are batch-embedded once (text-embedding-3-large,
+        the query space) and written back. Duplicate strings share one vector."""
+        import numpy as np
+        self._load_ev_cache()
+        keys = [self._ev_key(e) for e in evs]
+        miss = [e for e, k in zip(evs, keys) if k not in self._ev_vecs]
+        if miss:
+            uniq = list(dict.fromkeys(miss))            # dedupe before embedding
+            vecs = self.embed_many(uniq)
+            for text, v in zip(uniq, vecs):
+                arr = np.asarray(v, dtype="float32")
+                n = float(np.linalg.norm(arr))
+                self._ev_vecs[self._ev_key(text)] = arr / n if n else arr
+            self._ev_cache_dirty = True
+        return [self._ev_vecs.get(k) for k in keys]
+
+    def flush_ev_cache(self) -> bool:
+        """Persist the evidence-vector cache if it grew. Returns True if written."""
+        if not self._ev_cache_dirty or not self._ev_vecs:
+            return False
+        import numpy as np
+        os.makedirs(os.path.dirname(self.evidence_cache_path), exist_ok=True)
+        keys = list(self._ev_vecs)
+        vecs = np.stack([self._ev_vecs[k] for k in keys]).astype("float32")
+        tmp = self.evidence_cache_path + f".tmp.{os.getpid()}.npz"
+        np.savez(tmp, keys=np.array(keys), vecs=vecs)
+        os.replace(tmp, self.evidence_cache_path)
+        self._ev_cache_dirty = False
+        return True
 
     # -- PPR + evidence retriever -----------------------------------------
     @property
@@ -305,14 +383,17 @@ class KGBridge:
         """GraphFacts drawn ONLY from a subgraph's edges — the small-graph analog
         of grounded_facts. Applies the same generic/stub filter and deterministic
         confidence, and records full evidence text. Ranks edges by the PPR rank of
-        their closest endpoint so the most query-relevant claims come first."""
+        their closest endpoint so the most query-relevant claims come first.
+
+        Embeddings: the query embeds live (one call); evidence vectors come from
+        the content-hashed cache (evidence_vectors) — a hit is zero network, a miss
+        batch-embeds once and writes back. This is the whole point of two-stage
+        retrieval: the graph narrows WHERE to look, the cosine ranks WHAT is
+        actually relevant, and evidence is embedded at most once ever."""
         onto = getattr(self.retriever, "ONTOLOGY_RELS", frozenset())
         generic = onto | _GENERIC_RELS
-        try:
-            qv = self.embed(text) if text else None
-        except Exception:  # noqa: BLE001
-            qv = None
-        scored: list[tuple[float, GraphFact]] = []
+        # pass 1: collect surviving edges (rank, identity, claim, pid, ev-snippet)
+        rows: list[tuple] = []
         for key, entries in sub.edge_ev.items():
             pair = tuple(key)
             rank = min((sub.node_rank.get(n, 1e9) for n in pair), default=1e9)
@@ -325,16 +406,25 @@ class KGBridge:
                 identity = f"{head} [{rel}]"[:120]
                 claim = f"{head}  —  {ev}"
                 pid = str(e.get("pid", "") or "")
-                rel_score = 1.0
-                if qv is not None:
-                    try:
-                        rel_score = max(0.0, self._cosine(qv, self.embed(ev[:200])))
-                    except Exception:  # noqa: BLE001
-                        rel_score = 1.0
-                conf = fact_confidence(source="graph", paper_id=pid, relevance=rel_score)
-                self.evidence[identity] = claim
-                scored.append((rank, GraphFact(identity=identity, text=claim,
-                              source="graph", paper_id=pid, confidence=conf)))
+                rows.append((rank, identity, claim, pid, ev[:200]))
+        if not rows:
+            return []
+        # pass 2: query embeds live; evidence vectors come from the cache
+        rel_scores = [1.0] * len(rows)
+        if text:
+            try:
+                qv = self.embed(text)
+                ev_vecs = self.evidence_vectors([r[4] for r in rows])
+                rel_scores = [max(0.0, self._cosine(qv, ev)) if ev is not None else 1.0
+                              for ev in ev_vecs]
+            except Exception:  # noqa: BLE001
+                rel_scores = [1.0] * len(rows)
+        scored: list[tuple[float, GraphFact]] = []
+        for (rank, identity, claim, pid, _ev), rel_score in zip(rows, rel_scores):
+            conf = fact_confidence(source="graph", paper_id=pid, relevance=rel_score)
+            self.evidence[identity] = claim
+            scored.append((rank, GraphFact(identity=identity, text=claim,
+                          source="graph", paper_id=pid, confidence=conf)))
         scored.sort(key=lambda rf: rf[0])  # lower PPR rank = closer to query
         return [f for _, f in scored[:k]]
 

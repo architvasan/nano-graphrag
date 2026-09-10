@@ -192,6 +192,10 @@ class EventOrchestrator:
             record = root.run(ctx)  # the kernel owns the loop; verdict is numerical
         finally:
             self.bridge.active_subgraph = None  # slice is per-question; clear it
+            try:
+                self.bridge.flush_ev_cache()  # persist any newly-embedded evidence
+            except Exception:  # noqa: BLE001
+                pass
         summaries = self._summaries(record)
         # distilled-memory tree (parallel to the numerical credit channel)
         distill = self._distiller() if self.llm else None
