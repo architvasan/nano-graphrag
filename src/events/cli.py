@@ -28,12 +28,13 @@ from .orchestrator import EventOrchestrator
 from .sources import LLMFn
 
 
-def _default_llm() -> Optional[LLMFn]:
+def _default_llm(temperature: float = 0.0) -> Optional[LLMFn]:
     """Wire the ragmosis ALCF weak-LLM client if reachable; else None.
 
     Kept behind a factory so the CLI still runs (evidence-digest mode) when the
-    KG project / model endpoint is not importable from this environment.
-    """
+    KG project / model endpoint is not importable from this environment. The
+    ``temperature`` arg lets the tournament build diverging attempts (a fresh
+    callable per attempt at a rising temperature)."""
     kg_src = os.environ.get(
         "KG_MEMORY_ROOT", os.path.expanduser("~/Desktop/Projects/kg-memory-system")
     )
@@ -51,7 +52,7 @@ def _default_llm() -> Optional[LLMFn]:
                 [{"role": "user", "content": prompt}],
                 model,
                 cluster=cluster,
-                temperature=0.0,
+                temperature=temperature,
                 max_tokens=500,
             )
 

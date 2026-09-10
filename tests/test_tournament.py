@@ -96,3 +96,30 @@ def test_tournament_answer_runs_n_attempts_and_selects_winner():
     assert tourn.winner.answer == "ans@0.9"
     assert len(tourn.ranked) == 4
 
+
+def test_tournament_diverges_via_llm_factory():
+    # the factory must be called once per attempt at rising temps, base llm restored
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    from events.orchestrator import EventOrchestrator, AnswerResult
+    from events.summary import Summary
+
+    o = EventOrchestrator.__new__(EventOrchestrator)
+    o.llm = "BASE"
+    o.llm_factory = lambda t: f"llm@{t}"
+    o.tournament_temps = (0.0, 0.5, 0.9)
+    seen_temps = []
+
+    def fake_answer(question, key="q"):
+        seen_temps.append(o.llm)  # capture the swapped-in llm during the attempt
+        return AnswerResult(question=question, answer="a", n_subproblems=1,
+                            n_distinct_identities=1, confidence=0.5,
+                            summary=Summary(scope_key="q", kind="question", confidence=0.5))
+
+    o.answer_question = fake_answer
+    o._judge = lambda: None
+    o.tournament_answer("q", n_hypotheses=3)
+    assert seen_temps == ["llm@0.0", "llm@0.5", "llm@0.9"]  # diverging per attempt
+    assert o.llm == "BASE"  # base reasoner restored after
+
+

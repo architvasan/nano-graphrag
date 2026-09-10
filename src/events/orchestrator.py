@@ -74,6 +74,11 @@ class EventOrchestrator:
     llm: Optional[LLMFn] = None
     max_subproblems: int = 4
     max_walks: int = 2
+    #: optional (temperature -> LLMFn) factory; when set, tournament_answer builds
+    #: a diverging LLM per attempt at a rising temperature so rival hypotheses
+    #: actually differ. Without it, attempts share self.llm (may collapse to one).
+    llm_factory: Optional[Callable[[float], Optional[LLMFn]]] = None
+    tournament_temps: tuple = (0.0, 0.5, 0.9, 1.1)
 
     def _summaries(self, record: EpisodeRecord) -> list[dict]:
         """Read the child (subproblem) records — memory that fanned up."""
@@ -215,18 +220,29 @@ class EventOrchestrator:
         (ungameable floor) + an LLM justification-quality judge, selects a winner,
         and flags HARD (weak field / lucky guess). Returns the WINNER's full
         AnswerResult plus the TournamentResult. Divergence across attempts comes
-        from the stochastic web/graph escalation ordering; identical attempts
-        simply collapse to one effective hypothesis (honest, not theater)."""
+        from a per-attempt rising temperature (via llm_factory) when available;
+        otherwise from the stochastic web/graph escalation ordering. Attempts that
+        still collapse simply become one effective hypothesis (honest, not theater)."""
         attempts: list[tuple[AnswerResult, Hypothesis]] = []
-        for i in range(max(1, n_hypotheses)):
-            res = self.answer_question(question, key=f"{key}-h{i}")
-            hyp = Hypothesis(
-                label=f"h{i}",
-                answer=res.answer,
-                justification=self._justification(res),
-                confidence=res.confidence,
-            )
-            attempts.append((res, hyp))
+        base_llm = self.llm
+        n = max(1, n_hypotheses)
+        try:
+            for i in range(n):
+                # diverge: a fresh LLM at a rising temperature per attempt
+                if self.llm_factory is not None:
+                    temp = self.tournament_temps[min(i, len(self.tournament_temps) - 1)]
+                    made = self.llm_factory(temp)
+                    self.llm = made if made is not None else base_llm
+                res = self.answer_question(question, key=f"{key}-h{i}")
+                hyp = Hypothesis(
+                    label=f"h{i}",
+                    answer=res.answer,
+                    justification=self._justification(res),
+                    confidence=res.confidence,
+                )
+                attempts.append((res, hyp))
+        finally:
+            self.llm = base_llm  # always restore the base reasoner
         tourn = adjudicate(question, [h for _, h in attempts], judge=self._judge())
         winner_res = next(
             (r for r, h in attempts if tourn.winner and h.label == tourn.winner.label),
