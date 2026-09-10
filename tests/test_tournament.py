@@ -70,3 +70,29 @@ def test_judge_failure_falls_back_to_confidence():
 def test_empty_hypotheses_safe():
     r = adjudicate("q", [], judge=None)
     assert r.winner is None and not r.is_hard
+
+
+def test_tournament_answer_runs_n_attempts_and_selects_winner():
+    # stub orchestrator: patch answer_question to return varying confidences
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    from events.orchestrator import EventOrchestrator, AnswerResult
+    from events.summary import Summary
+
+    o = EventOrchestrator.__new__(EventOrchestrator)
+    o.llm = None  # no judge -> quality defaults to deterministic confidence
+
+    confs = iter([0.3, 0.9, 0.5, 0.4])
+
+    def fake_answer(question, key="q"):
+        c = next(confs)
+        return AnswerResult(question=question, answer=f"ans@{c}", n_subproblems=1,
+                            n_distinct_identities=1, confidence=c,
+                            summary=Summary(scope_key="q", kind="question", confidence=c))
+
+    o.answer_question = fake_answer
+    winner_res, tourn = o.tournament_answer("q", n_hypotheses=4)
+    assert winner_res.confidence == 0.9        # highest-confidence attempt wins
+    assert tourn.winner.answer == "ans@0.9"
+    assert len(tourn.ranked) == 4
+

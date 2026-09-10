@@ -20,6 +20,7 @@ from .kg_bridge import KGBridge
 from .sources import LLMFn, QuestionSource
 from .summary import Summary, summary_from_record
 from .merge import merge_overlay_into_parallel
+from .tournament import Hypothesis, TournamentResult, adjudicate
 
 __all__ = ["AnswerResult", "EventOrchestrator", "build_context"]
 
@@ -201,3 +202,70 @@ class EventOrchestrator:
             )
             return (self.llm(prompt) or "").strip()
         return _d
+
+    # -- tournament mode --------------------------------------------------
+    def tournament_answer(
+        self, question: str, key: str = "q", *, n_hypotheses: int = 4,
+    ) -> tuple[AnswerResult, TournamentResult]:
+        """Run N independent rival attempts and let the parent adjudicate.
+
+        Each attempt is a full, independent answer_question pass (its own episode
+        tree, escalation, web rescue), yielding an answer + justification + the
+        DETERMINISTIC confidence. adjudicate() then scores them by confidence
+        (ungameable floor) + an LLM justification-quality judge, selects a winner,
+        and flags HARD (weak field / lucky guess). Returns the WINNER's full
+        AnswerResult plus the TournamentResult. Divergence across attempts comes
+        from the stochastic web/graph escalation ordering; identical attempts
+        simply collapse to one effective hypothesis (honest, not theater)."""
+        attempts: list[tuple[AnswerResult, Hypothesis]] = []
+        for i in range(max(1, n_hypotheses)):
+            res = self.answer_question(question, key=f"{key}-h{i}")
+            hyp = Hypothesis(
+                label=f"h{i}",
+                answer=res.answer,
+                justification=self._justification(res),
+                confidence=res.confidence,
+            )
+            attempts.append((res, hyp))
+        tourn = adjudicate(question, [h for _, h in attempts], judge=self._judge())
+        winner_res = next(
+            (r for r, h in attempts if tourn.winner and h.label == tourn.winner.label),
+            attempts[0][0],
+        )
+        return winner_res, tourn
+
+    def _justification(self, res: AnswerResult) -> str:
+        """The winner's reasoning trace: distilled subproblem summaries + the
+        confidence they carried — what the answer is grounded on."""
+        if res.summary is None:
+            return res.answer
+        parts = [
+            f"{c.scope_key} (conf {c.confidence:.2f}): {c.text or '; '.join(c.key_relations[:3])}"
+            for c in res.summary.children
+        ]
+        return " | ".join(parts) or res.answer
+
+    def _judge(self):
+        """LLM justification-quality judge: (question, answer, justification) ->
+        0-1. Rates how well the reasoning supports the answer — the tiebreaker
+        that catches lucky guesses. No LLM -> None (adjudicate uses the floor)."""
+        if self.llm is None:
+            return None
+        llm = self.llm
+
+        def _j(question: str, answer: str, justification: str) -> float:
+            prompt = (
+                f"Question:\n{question}\n\nProposed answer:\n{answer}\n\n"
+                f"Reasoning offered:\n{justification}\n\n"
+                "Rate ONLY how well the reasoning supports the answer with concrete, "
+                "on-topic evidence (not confident phrasing). Reply with a single "
+                "number 0.0-1.0 and nothing else."
+            )
+            try:
+                raw = (llm(prompt) or "").strip()
+                import re
+                m = re.search(r"[01](?:\.\d+)?", raw)
+                return float(m.group()) if m else 0.0
+            except Exception:  # noqa: BLE001
+                return 0.0
+        return _j
