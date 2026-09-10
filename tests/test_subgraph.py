@@ -196,6 +196,17 @@ def test_evidence_cache_roundtrip_persist_and_load():
     os.remove(b.evidence_cache_path)
 
 
+def test_web_disabled_blocks_all_web():
+    """web_disabled=True must return no web hits AND no web_fill, even with an
+    injected web_search_fn present (no silent fallback)."""
+    from events.kg_bridge import KGBridge
+    b = KGBridge.__new__(KGBridge)
+    b.web_disabled = True
+    b.web_search_fn = lambda q, n: [{"url": "x", "title": "t", "description": "d"}]
+    assert b._web_hits("anything", 3) == []
+    assert b.web_fill("anything") is None
+
+
 def test_edge_key_stable_and_direction_insensitive():
     from events.kg_bridge import KGBridge
     k1 = KGBridge.edge_key("Nipah G", "is_receptor_for", "ephrin-B2")

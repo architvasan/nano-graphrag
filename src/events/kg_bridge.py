@@ -136,6 +136,10 @@ class KGBridge:
     #: Defaults to hermes_tools inside the Hermes runtime; inject a callable
     #: (e.g. ragmosis OpenAlex/Semantic-Scholar rescue) to run standalone.
     web_search_fn: Any = None
+    #: hard switch: when True, web rescue is DISABLED entirely (no injected fn,
+    #: no hermes_tools fallback) — for KG-only runs that must match KG-only
+    #: baselines. Distinct from web_search_fn=None, which still falls back.
+    web_disabled: bool = False
     #: chars of page body pulled per web source. Abstracts alone (~200 chars)
     #: lack quantitative rules; deeper text lets the reasoner ground on results.
     web_body_chars: int = 2500
@@ -572,6 +576,8 @@ class KGBridge:
         This is a string/graph task (rule 2): it never emits a verdict. The new
         node is a post-verdict proposal; it is NOT written into the base KG.
         """
+        if self.web_disabled:
+            return None
         try:
             from hermes_tools import web_search, web_extract  # type: ignore
         except Exception:
@@ -605,6 +611,8 @@ class KGBridge:
         """Return web hits [{"url","title","description"}] from the injected
         backend, or hermes_tools inside the Hermes runtime. Empty on absence —
         the surface degrades gracefully rather than fabricating results."""
+        if self.web_disabled:
+            return []
         if self.web_search_fn is not None:
             try:
                 hits = self.web_search_fn(query, limit) or []
