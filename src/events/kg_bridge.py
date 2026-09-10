@@ -406,7 +406,9 @@ class KGBridge:
                 identity = f"{head} [{rel}]"[:120]
                 claim = f"{head}  —  {ev}"
                 pid = str(e.get("pid", "") or "")
-                rows.append((rank, identity, claim, pid, ev[:200]))
+                # 300-char snippet matches edge_typing.py so the evidence-vector
+                # cache is interoperable with the typing pipeline's embeddings.
+                rows.append((rank, identity, claim, pid, ev[:300]))
         if not rows:
             return []
         # pass 2: query embeds live; evidence vectors come from the cache
